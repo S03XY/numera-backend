@@ -542,16 +542,23 @@ export class RelayService implements OnModuleInit {
         await this.rpc!.call({ account: this.account!.address, to, data });
         gas = await this.rpc!.estimateGas({ account: this.account!.address, to, data });
       } catch (err) {
-        const reason = revertReason(err);
         // Logged as well as thrown. The message that reaches the caller is deliberately vague —
         // it is rendered to a user — and a custom error the decoder does not know produces the
-        // generic fallback, which then says nothing to anyone. The `permit` path already logged
-        // its failures for exactly this reason; this one did not, and a `relay` rejected in
-        // simulation was indistinguishable from a relayer that had simply stopped working.
+        // generic fallback, which then says nothing to anyone.
+        if (isTransportFailure(err)) {
+          this.log.warn(`${label} could not be simulated: ${describeRevert(err)}`);
+          throw new RelayRejected(
+            'unavailable',
+            'The network did not answer, so this could not be submitted. Nothing was sent and ' +
+              'nothing was spent — try again in a moment.',
+            err,
+          );
+        }
         this.log.warn(`${label} rejected in simulation: ${describeRevert(err)}`);
         throw new RelayRejected(
           'rejected',
-          reason?.user ?? 'The contract rejected this call. Nothing was sent and nothing was spent.',
+          revertReason(err)?.user ??
+            'The contract rejected this call. Nothing was sent and nothing was spent.',
           err,
         );
       }
@@ -620,6 +627,22 @@ export class RelayService implements OnModuleInit {
       await this.rpc!.call({ account: this.account!.address, to: forwarder, data });
       gas = await this.rpc!.estimateGas({ account: this.account!.address, to: forwarder, data });
     } catch (err) {
+      /*
+        A node that did not answer is not a contract that said no.
+
+        These were reported identically, and the wrong one is actively misleading: it tells a
+        trader their request is invalid, returns a 400 so nothing retries, and sends whoever is
+        debugging it hunting for a revert that never happened. Twice, in my case.
+      */
+      if (isTransportFailure(err)) {
+        this.log.warn(`could not simulate for ${request.from}: ${describeRevert(err)}`);
+        throw new RelayRejected(
+          'unavailable',
+          'The network did not answer, so this could not be submitted. Nothing was sent and ' +
+            'nothing was spent — try again in a moment.',
+          err,
+        );
+      }
       const reason = revertReason(err);
       this.log.warn(`simulation failed for ${request.from}: ${reason?.log ?? 'no revert data'}`);
       // The sender gets the real cause when we recognise it.
@@ -1024,4 +1047,33 @@ function revertReason(err: unknown): RevertReason | null {
 
 function describeRevert(err: unknown): string {
   return revertReason(err)?.log ?? 'no revert data';
+}
+
+/**
+ * Did the node fail to answer, rather than the contract refusing?
+ *
+ * The two are opposite facts and were reported as the same one. A simulation that cannot reach the
+ * RPC produced "The contract rejected this call. Nothing was sent and nothing was spent." — which
+ * names the wrong party, tells the user their request is invalid when it is fine, and returns a 400
+ * so the client never retries something that would have worked a second later.
+ *
+ * Detected by absence rather than by matching viem's error classes: a genuine revert always carries
+ * revert data somewhere in its cause chain, and a transport failure never does. Matching class
+ * names would break the next time viem renames one.
+ */
+function isTransportFailure(err: unknown): boolean {
+  for (let node: unknown = err, depth = 0; node && depth < 8; depth += 1) {
+    const data = (node as { data?: unknown }).data;
+    if (typeof data === 'string' && data.startsWith('0x') && data.length >= 10) return false;
+    node = (node as { cause?: unknown }).cause;
+  }
+  const text = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    text.includes('rpc request failed') ||
+    text.includes('http request failed') ||
+    text.includes('timed out') ||
+    text.includes('fetch failed') ||
+    text.includes('socket') ||
+    text.includes('econnreset')
+  );
 }

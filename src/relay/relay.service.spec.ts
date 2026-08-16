@@ -485,3 +485,63 @@ describe('the relay reports', () => {
     });
   });
 });
+
+/**
+ * A node that did not answer is not a contract that said no.
+ *
+ * These were reported identically: an unreachable RPC came back as "the contract rejected this
+ * request", a 400, and therefore something no client retries. It is the wrong party, the wrong
+ * advice, and the wrong status — and it cost two debugging sessions chasing a revert that had
+ * never happened.
+ */
+describe('RelayService — a failed simulation is not always a refusal', () => {
+  const transport = () => new Error('RPC Request failed.');
+  // A genuine revert always carries revert data somewhere in its cause chain; a transport failure
+  // never does, which is what the two are told apart by.
+  const revert = () => Object.assign(new Error('execution reverted'), { cause: { data: '0xd6bda275' } });
+
+  function serviceThatFailsSimulation(makeError: () => Error) {
+    const svc = makeService();
+    const internals = svc as unknown as {
+      rpc: { call: jest.Mock; estimateGas: jest.Mock };
+    };
+    internals.rpc.call = jest.fn(async () => {
+      throw makeError();
+    });
+    internals.rpc.estimateGas = jest.fn(async () => {
+      throw makeError();
+    });
+    return svc;
+  }
+
+  it('treats an unreachable node as temporary, so the caller retries', async () => {
+    const svc = serviceThatFailsSimulation(transport);
+
+    const err = await svc
+      .sendFromRelayer(ENGINE as `0x${string}`, '0x1234', 'probe')
+      .then(() => null, (e: RelayRejected) => e);
+
+    expect(err?.code).toBe('unavailable');
+    expect(err?.message).toMatch(/network did not answer/i);
+  });
+
+  it('still reports a real revert as a refusal (positive)', async () => {
+    const svc = serviceThatFailsSimulation(revert);
+
+    const err = await svc
+      .sendFromRelayer(ENGINE as `0x${string}`, '0x1234', 'probe')
+      .then(() => null, (e: RelayRejected) => e);
+
+    expect(err?.code).toBe('rejected');
+    expect(err?.message).toMatch(/contract rejected/i);
+  });
+
+  it('does the same for a relayed trade, which had the identical flaw', async () => {
+    const svc = serviceThatFailsSimulation(transport);
+
+    const err = await reject(svc, payload());
+
+    expect(err.code).toBe('unavailable');
+    expect(err.message).toMatch(/network did not answer/i);
+  });
+});
