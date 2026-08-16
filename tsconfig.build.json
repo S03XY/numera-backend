@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  // `prisma` and `scripts` must be excluded: they live outside src, which would
+  // widen the inferred rootDir and emit dist/src/main.js instead of dist/main.js —
+  // breaking `start:prod` and the Dockerfile CMD.
+  //
+  // Both are operator tooling run through ts-node (`db:seed`, `seed:testnet`,
+  // `resolve`), never part of the server bundle.
+  "exclude": ["node_modules", "test", "dist", "prisma", "scripts", "**/*spec.ts"]
+}

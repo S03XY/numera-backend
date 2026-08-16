@@ -1,0 +1,65 @@
+# Full local/production-like stack: TimescaleDB + Redis + the NestJS backend.
+#   docker compose up -d --build
+# The backend waits for the DB, runs migrations, then starts.
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:2.17.2-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-market}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-market_password_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-prediction_market}
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-market} -d ${POSTGRES_DB:-prediction_market}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
+    ports:
+      - '${REDIS_PORT:-6379}:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Override host-facing values with in-network service names.
+      NODE_ENV: production
+      POSTGRES_HOST: timescaledb
+      POSTGRES_PORT: 5432
+      DATABASE_URL: postgresql://${POSTGRES_USER:-market}:${POSTGRES_PASSWORD:-market_password_change_me}@timescaledb:5432/${POSTGRES_DB:-prediction_market}?schema=public
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    ports:
+      - '${PORT:-3000}:3000'
+
+volumes:
+  timescale_data:
+  redis_data:

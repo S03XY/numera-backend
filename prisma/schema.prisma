@@ -1,0 +1,441 @@
+// Prediction Market — data model
+//
+// PRIVACY INVARIANT (do not violate):
+//   • `User` is the off-chain login identity (real wallet, used only to sign in).
+//   • `Trade` / `Position` are keyed by the on-chain *execution account* — the
+//     unlinkable ephemeral account Unlink routes each bet through.
+//   • There is deliberately NO column anywhere linking a User to an execution
+//     account. That mapping lives only in the user's client (Unlink SDK). Storing
+//     it here would recreate exactly the linkage the whole system exists to hide.
+//
+// All on-chain uint256 values are stored as Decimal(78,0) (uint256 has ≤78 digits)
+// so nothing can overflow. Sequential ids / block numbers use BigInt (int8).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Pricing engine backing a market.
+///
+/// One engine, deliberately. A parimutuel pool cannot let a trader exit before
+/// settlement, and the fixed-`b` LMSR needs a protocol-funded `b*ln(n)` subsidy;
+/// the damped liquidity-sensitive curve removes the need for both.
+enum Engine {
+  LS_LMSR
+}
+
+enum MarketStatus {
+  TRADING
+  RESOLVED
+  INVALID
+}
+
+enum TradeSide {
+  BUY // long an outcome
+  SELL // reduce or exit a position
+  SHORT // buyComplement: one share of every OTHER outcome, paying 1 iff this outcome loses
+}
+
+/// Where a market's settlement has got to, mirroring `OptimisticResolver.Phase`.
+///
+/// Read straight off the chain rather than inferred from timestamps: a proposal whose window has
+/// expired is still `PROPOSED` until somebody actually calls `finalize`, and showing it as settled
+/// before that would tell a trader their money is claimable when it is not.
+enum ResolutionPhase {
+  NONE // nothing proposed yet, or a stuck dispute was unwound
+  PROPOSED // an outcome is asserted; the dispute window is running
+  DISPUTED // challenged, awaiting the quorum
+  SETTLED // pushed to the engine; terminal
+}
+
+/// How a settlement was reached. Drives what the UI explains to a trader.
+enum ResolutionRoute {
+  FINALIZED // the window passed unchallenged
+  ARBITRATED // the quorum ruled
+}
+
+/// Off-chain login identity. One row per real wallet address that has signed in.
+model User {
+  id          String   @id @default(uuid()) @db.Uuid
+  address     String   @unique // EIP-55-lowercased real wallet address
+  displayName String?  @map("display_name")
+  avatarUrl   String?  @map("avatar_url")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  lastLoginAt DateTime @default(now()) @map("last_login_at")
+
+  /// The user's Unlink (shielded) address, recorded at registration.
+  ///
+  /// Required to authorize authorization-token issuance: that token grants read
+  /// access to this address's balances and history, so we must be able to prove
+  /// the requesting session owns it.
+  ///
+  /// PRIVACY: this links a login identity to a shielded identity. It does NOT
+  /// deanonymize trades — execution accounts are what appear on-chain, and this
+  /// server never learns them. Only Unlink's engine maps an Unlink address to its
+  /// execution accounts, so deanonymization needs *both* parties to collude,
+  /// which is inherent to a hosted custody model.
+  unlinkAddress String? @unique @map("unlink_address")
+
+  sessions RefreshSession[]
+
+  @@map("users")
+}
+
+/// A live refresh-token session. Lets a returning user "just connect wallet"
+/// (exchange refresh → access) without re-signing until the session expires or
+/// is revoked. Stores only a hash of the token; rotated on every refresh.
+model RefreshSession {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @map("token_hash") // sha256(refresh jwt)
+  userAgent String?   @map("user_agent")
+  ip        String?
+  createdAt DateTime  @default(now()) @map("created_at")
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("refresh_sessions")
+}
+
+/// Category catalog (mirrors MarketFactory CategorySet + admin-managed labels).
+model Category {
+  key       String   @id // free-form tag, e.g. "SPORTS"
+  label     String
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  markets Market[]
+
+  @@map("categories")
+}
+
+/// A market on one of the engine contracts. Uniquely identified on-chain by
+/// (engine contract address, on-chain marketId). Off-chain presentation fields
+/// (title/description/image/outcome labels) are editable metadata.
+model Market {
+  id               String       @id @default(uuid()) @db.Uuid
+  engine           Engine
+  address          String // engine contract address (lowercase)
+  marketId         BigInt       @map("market_id") // on-chain market id
+  // --- immutable on-chain config ---
+  collateral       String
+  resolver         String
+  /// When betting opens. Enforced on chain: a trade before this reverts with `MarketNotOpenYet`.
+  ///
+  /// Always set — the engine defaults an unspecified start to the creation block's timestamp — so
+  /// this is never null and "opens immediately" is simply a start time in the past. That keeps the
+  /// UI's question ("is it open?") a single comparison rather than a null check plus a comparison.
+  startTime        DateTime     @map("start_time")
+  closeTime        DateTime     @map("close_time")
+  outcomeCount     Int          @map("outcome_count")
+  categoryKey      String?      @map("category_key")
+  metadataHash     String       @map("metadata_hash")
+  creator          String // seeded the book; their loss is bounded at b*ln(n)
+  /// Liquidity coefficient (WAD). Immutable on-chain.
+  alpha            Decimal      @db.Decimal(78, 0)
+  /// Damping scale (WAD). 0 would be pure LS-LMSR. Immutable on-chain.
+  sStar            Decimal      @map("s_star") @db.Decimal(78, 0)
+  /// Shares of every outcome the creator seeded, locked until resolution.
+  seed             Decimal      @db.Decimal(78, 0)
+  // --- mutable state (indexed from chain) ---
+  status           MarketStatus @default(TRADING)
+  winningOutcomeId Int?         @map("winning_outcome_id")
+  /// Collateral this market holds, base units. Always >= max(shares) on-chain.
+  pot              Decimal      @default(0) @db.Decimal(78, 0)
+  /// Swept to the fee recipient at settlement: collateral - winning shares.
+  surplus          Decimal?     @db.Decimal(78, 0)
+  // --- off-chain presentation ---
+  title            String       @default("")
+  description      String       @default("")
+  /// How this market settles, as published at creation.
+  ///
+  /// Not presentation, despite sitting here: it is inside `metadataHash`, which the engine stores
+  /// immutably. Anyone can re-encode what the API serves, hash it, and check it against the chain.
+  /// That is what makes it a commitment rather than a claim, and it is why nothing may edit it.
+  resolutionRules  String       @default("") @map("resolution_rules")
+  imageUrl         String?      @map("image_url")
+  // --- provenance ---
+  createdBlock     BigInt       @map("created_block")
+  createdTx        String       @map("created_tx")
+  createdAt        DateTime     @default(now()) @map("created_at")
+  updatedAt        DateTime     @updatedAt @map("updated_at")
+
+  category   Category?           @relation(fields: [categoryKey], references: [key])
+  outcomes   Outcome[]
+  trades     Trade[]
+  positions  Position[]
+  resolution ResolutionProposal?
+
+  @@unique([address, marketId])
+  @@index([status])
+  @@index([categoryKey])
+  @@index([closeTime])
+  @@index([engine])
+  @@map("markets")
+}
+
+/// One outcome of a market. Holds the live price (WAD) and outstanding shares,
+/// kept up to date by the indexer on every trade.
+model Outcome {
+  id              String  @id @default(uuid()) @db.Uuid
+  marketRef       String  @map("market_ref") @db.Uuid
+  index           Int // 0-based outcome id
+  label           String  @default("")
+  currentPriceWad Decimal @default(0) @map("current_price_wad") @db.Decimal(78, 0)
+  currentShares   Decimal @default(0) @map("current_shares") @db.Decimal(78, 0)
+
+  market Market @relation(fields: [marketRef], references: [id], onDelete: Cascade)
+
+  @@unique([marketRef, index])
+  @@map("outcomes")
+}
+
+/// A single public, pseudonymous on-chain trade. `account` is the unlinkable
+/// execution account, never a real user. Idempotent on (txHash, logIndex).
+model Trade {
+  id           String    @id @default(uuid()) @db.Uuid
+  marketRef    String    @map("market_ref") @db.Uuid
+  engine       Engine
+  account      String // execution account (lowercase) — pseudonymous, NOT a user
+  side         TradeSide
+  outcomeIndex Int       @map("outcome_index")
+  shares       Decimal   @default(0) @db.Decimal(78, 0) // shares bought/sold on this leg
+  amount       Decimal   @default(0) @db.Decimal(78, 0) // collateral in/out
+  /// The spread applied to this trade (WAD), phi = 0.005 + 0.015*(1-t/T) + 0.010*|p-1/n|.
+  spreadWad    Decimal   @default(0) @map("spread_wad") @db.Decimal(78, 0)
+  priceWad     Decimal   @default(0) @map("price_wad") @db.Decimal(78, 0) // outcome price after trade
+  blockNumber  BigInt    @map("block_number")
+  txHash       String    @map("tx_hash")
+  logIndex     Int       @map("log_index")
+  timestamp    DateTime
+
+  market Market @relation(fields: [marketRef], references: [id], onDelete: Cascade)
+
+  @@unique([txHash, logIndex])
+  @@index([marketRef, timestamp])
+  @@index([account])
+  @@index([timestamp])
+  @@map("trades")
+}
+
+/// Net position of one execution account in one outcome, derived from trades.
+/// Public/pseudonymous. A user's portfolio is assembled CLIENT-SIDE by querying
+/// the accounts the client knows are its own — the server never links them.
+model Position {
+  id           String   @id @default(uuid()) @db.Uuid
+  marketRef    String   @map("market_ref") @db.Uuid
+  account      String // execution account (lowercase)
+  outcomeIndex Int      @map("outcome_index")
+  shares       Decimal  @default(0) @db.Decimal(78, 0) // net shares held in this outcome
+  costBasis    Decimal  @default(0) @map("cost_basis") @db.Decimal(78, 0) // net collateral in
+  realizedPnl  Decimal  @default(0) @map("realized_pnl") @db.Decimal(78, 0)
+  redeemed     Boolean  @default(false)
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  market Market @relation(fields: [marketRef], references: [id], onDelete: Cascade)
+
+  @@unique([marketRef, account, outcomeIndex])
+  @@index([account])
+  @@map("positions")
+}
+
+/// Time-series price samples (TimescaleDB hypertable — see migration).
+/// One row per (market, outcome, second); the initial migration converts this
+/// table into a hypertable partitioned on `time` and adds 1m/1h candle
+/// continuous aggregates for fast OHLC chart queries.
+model PricePoint {
+  time         DateTime @db.Timestamptz(6)
+  marketRef    String   @map("market_ref") @db.Uuid
+  outcomeIndex Int      @map("outcome_index")
+  priceWad     Decimal  @map("price_wad") @db.Decimal(78, 0)
+  volume       Decimal  @default(0) @db.Decimal(78, 0) // collateral traded in this sample
+
+  @@id([marketRef, outcomeIndex, time])
+  @@index([time])
+  @@map("price_points")
+}
+
+/// Off-chain market presentation metadata, committed on-chain by hash.
+///
+/// Flow: an operator drafts the copy (title/description/outcome labels) BEFORE
+/// creating the market. The backend returns `metadataHash` = keccak256 of the
+/// canonical JSON; the operator passes that exact hash to `createMarket(...)`.
+/// When the indexer later sees `MarketCreated` carrying that hash it adopts the
+/// draft — so the public on-chain commitment provably matches the copy we serve,
+/// and anyone can verify it by re-hashing what the API returns.
+model MarketMetadataDraft {
+  metadataHash    String   @id @map("metadata_hash")
+  title           String
+  description     String   @default("")
+  resolutionRules String   @default("") @map("resolution_rules")
+  imageUrl        String?  @map("image_url")
+  outcomeLabels   String[] @map("outcome_labels")
+  categoryKey     String?  @map("category_key")
+  createdBy       String   @map("created_by") // operator wallet that drafted it
+  marketRef       String?  @map("market_ref") @db.Uuid // set once adopted by a market
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@index([createdBy])
+  @@index([marketRef])
+  @@map("market_metadata_drafts")
+}
+
+/// One market's trip through the resolution layer, mirrored from chain events.
+///
+/// PRIVACY: `proposer` and `disputer` are **market execution accounts**, exactly like `Trade.account`
+/// — never login wallets. That is not incidental, it is the point: proposals are relayed from the
+/// same shielded account that placed the bets, so this table can no more identify a proposer than
+/// the trade table can identify a trader. Do not add a user relation to it.
+///
+/// One row per market. It is upserted through the lifecycle rather than appended to, because the
+/// chain holds exactly one proposal per market and a table that disagreed with the chain would be a
+/// second source of truth. A dispute that times out and unwinds resets the row to `NONE`, matching
+/// `resetStuckDispute`, and the history stays in the event log where it belongs.
+model ResolutionProposal {
+  id        String  @id @default(uuid()) @db.Uuid
+  /// The engine address the market lives on, lowercase.
+  address   String
+  marketId  BigInt  @map("market_id")
+  /// The market row this settles, when the indexer has seen it.
+  ///
+  /// Nullable on purpose. A proposal can be indexed before the market it is about — the resolver is
+  /// a different contract on a different stream — and dropping it in that window would lose the
+  /// proposal entirely. It is filled in on the next event once the market catches up.
+  marketRef String? @unique @map("market_ref") @db.Uuid
+
+  phase ResolutionPhase @default(NONE)
+
+  // --- the proposal ---
+  /// Market account that asserted the outcome, or an operator wallet on the bond-free path.
+  proposer        String?
+  /// Asserted outcome index, or null when the assertion is "void this market".
+  proposedOutcome Int?      @map("proposed_outcome")
+  /// False for a `RESOLVER_ROLE` proposal: nothing staked, so nothing to forfeit.
+  proposerBonded  Boolean   @default(false) @map("proposer_bonded")
+  proposerBond    Decimal   @default(0) @map("proposer_bond") @db.Decimal(78, 0)
+  disputeDeadline DateTime? @map("dispute_deadline")
+
+  // --- the dispute ---
+  disputer            String?
+  /// What the disputer says the answer is. Null means "void".
+  counterOutcome      Int?      @map("counter_outcome")
+  disputerBond        Decimal   @default(0) @map("disputer_bond") @db.Decimal(78, 0)
+  arbitrationDeadline DateTime? @map("arbitration_deadline")
+
+  // --- the settlement ---
+  route          ResolutionRoute?
+  /// Settled outcome index; null with `settledAt` set means the market was voided.
+  settledOutcome Int?             @map("settled_outcome")
+  /// Paid to whoever was right. Zero on a bond-free proposal.
+  reward         Decimal          @default(0) @db.Decimal(78, 0)
+  /// The losing side's forfeited stake. Zero when nobody staked or nobody was wrong.
+  forfeited      Decimal          @default(0) @db.Decimal(78, 0)
+  /// Market account that lost its stake, if any.
+  loser          String?
+  settledAt      DateTime?        @map("settled_at")
+
+  // --- provenance ---
+  proposedTx String?  @map("proposed_tx")
+  settledTx  String?  @map("settled_tx")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  market Market? @relation(fields: [marketRef], references: [id], onDelete: Cascade)
+
+  @@unique([address, marketId])
+  @@index([phase])
+  @@index([disputeDeadline])
+  @@map("resolution_proposals")
+}
+
+/// Market accounts barred from trading, mirrored from `TradingBlocklist`.
+///
+/// PRIVACY: same rule as above — these are execution accounts. A ban is public on chain already,
+/// so mirroring it here reveals nothing new, and the API needs it to explain a failed trade as
+/// "this account is barred" rather than a bare revert.
+///
+/// The chain is authoritative. This table exists so the UI can answer the question without an RPC
+/// round trip on every render, and it is rebuilt from events, never written to by hand.
+model BannedAccount {
+  /// Execution account, lowercase.
+  account   String    @id
+  /// Engine address the ruling came from, when a resolver banned rather than an operator.
+  context   String?
+  marketId  BigInt?   @map("market_id")
+  bannedAt  DateTime  @map("banned_at")
+  /// Set when the ban is lifted. Kept rather than deleted so the record survives.
+  liftedAt  DateTime? @map("lifted_at")
+  txHash    String?   @map("tx_hash")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  @@index([liftedAt])
+  @@map("banned_accounts")
+}
+
+/// What kind of event put a leaf into the shielded pool's state tree.
+enum PoolLeafKind {
+  /// `Deposited`. Carries a label, and is the only kind entered into the association set.
+  DEPOSIT
+  /// `Withdrawn`. Spending part of a note mints a note for the remainder, and that is a leaf too.
+  CHANGE
+}
+
+/// One leaf of the shielded pool's state tree, in the order the chain inserted it.
+///
+/// PRIVACY: every column here is already public on chain, and deliberately so — this table is a
+/// mirror, not a ledger. There is no owner column and there cannot be one: the whole point of the
+/// pool is that nobody, including us, can say which leaf belongs to whom. A browser identifies its
+/// own notes by recomputing precommitments from a secret it never sends anywhere.
+///
+/// WHY IT EXISTS: a withdrawal proof needs a Merkle path through the complete tree, and building
+/// that in the browser would mean scanning every block since deployment at a hundred blocks per
+/// request. This turns that into one GET.
+///
+/// ORDER IS THE WHOLE CONTRACT. A lean incremental Merkle tree is append-only, so a tree built from
+/// these rows is correct only if they come back in exactly block-then-log order. Get it wrong and
+/// the root diverges from the chain's, every proof is rejected with `UnknownStateRoot`, and nothing
+/// says why. Read through `@@index([blockNumber, logIndex])`, never by insertion id.
+model PoolLeaf {
+  id            BigInt       @id @default(autoincrement())
+  blockNumber   BigInt       @map("block_number")
+  logIndex      Int          @map("log_index")
+  txHash        String       @map("tx_hash")
+  kind          PoolLeafKind
+  /// The leaf itself, as a decimal uint256 string. Postgres has no 256-bit integer.
+  commitment    String
+  /// `Poseidon(scope, nonce)`. Deposits only; a change note inherits its parent's lineage.
+  label         String?
+  /// Deposited amount, or the amount withdrawn for a `CHANGE` leaf.
+  value         String
+  /// `Poseidon(nullifier, secret)`. How a browser recognises a deposit as its own.
+  precommitment String?
+  /// `Poseidon(nullifier)` of the note that was spent. How a browser follows its own change chain.
+  spentNullifier String?     @map("spent_nullifier")
+  createdAt     DateTime     @default(now()) @map("created_at")
+
+  /// Idempotency: re-scanning a range after a crash rewrites these rows rather than duplicating.
+  @@unique([txHash, logIndex])
+  @@index([blockNumber, logIndex])
+  @@map("pool_leaves")
+}
+
+/// Resumable, reorg-safe indexer cursor. One row per indexed contract stream.
+model IndexerCursor {
+  stream    String   @id // logical stream name (usually a contract address)
+  lastBlock BigInt   @default(0) @map("last_block")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("indexer_cursors")
+}
